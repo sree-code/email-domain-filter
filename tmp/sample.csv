@@ -1,0 +1,4 @@
+name,email,notes
+Alice,alice@insightglobal.com,test
+Bob,bob@sub.insightglobal.com,subdomain
+Carol,carol@gmail.com,ignore
