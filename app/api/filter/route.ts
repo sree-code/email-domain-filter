@@ -1,94 +1,196 @@
-import { NextResponse } from "next/server";
-import fs from "fs/promises";
 import path from "path";
-import os from "os";
-import crypto from "crypto";
-import { spawn } from "child_process";
+import { NextResponse } from "next/server";
+import * as XLSX from "xlsx";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+const SUPPORTED_EXTENSIONS = new Set([".xlsx", ".xls", ".csv", ".tsv"]);
+
+type ResultRow = {
+  email: string;
+  domain: string;
+  source_file: string;
+  sheet: string;
+  row_index: number;
+  column: string;
+};
 
 function isFile(value: unknown): value is File {
   return typeof File !== "undefined" && value instanceof File;
 }
 
-async function saveFile(file: File, dir: string) {
-  const arrayBuffer = await file.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const filename = `${crypto.randomUUID()}_${safeName}`;
-  const filePath = path.join(dir, filename);
-  await fs.writeFile(filePath, buffer);
-  return filePath;
+function normalizeDomain(domain: string): string {
+  const trimmed = domain.trim().toLowerCase();
+  return trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
 }
 
-async function findPythonExecutable(repoRoot: string): Promise<string> {
-  if (process.env.PYTHON_BIN?.trim()) {
-    return process.env.PYTHON_BIN.trim();
+function domainMatches(email: string, domain: string, exact: boolean): boolean {
+  const atIndex = email.lastIndexOf("@");
+  if (atIndex === -1) {
+    return false;
   }
-
-  const venvPython = path.join(repoRoot, ".venv", "bin", "python");
-  try {
-    await fs.access(venvPython);
-    return venvPython;
-  } catch {
-    return "python3";
+  const host = email.slice(atIndex + 1).toLowerCase();
+  if (exact) {
+    return host === domain;
   }
+  return host === domain || host.endsWith(`.${domain}`);
 }
 
-function formatPythonError(message: string): string {
-  if (!message.includes("ModuleNotFoundError") || !message.includes("pandas")) {
-    return message;
+function parseColumns(columns: string): Set<string> | null {
+  const normalized = columns
+    .split(",")
+    .map((column) => column.trim().toLowerCase())
+    .filter(Boolean);
+  if (normalized.length === 0) {
+    return null;
   }
-
-  return [
-    "Python dependency `pandas` is missing for this project.",
-    "Create a virtual environment and install requirements:",
-    "python3.11 -m venv .venv",
-    "source .venv/bin/activate",
-    "python -m pip install -r requirements.txt",
-    "",
-    "Alternatively set PYTHON_BIN to a Python executable that already has dependencies installed."
-  ].join("\n");
+  return new Set(normalized);
 }
 
-function runPython(
-  pythonBin: string,
-  args: string[],
-  cwd: string
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(pythonBin, args, { cwd });
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-    child.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-    child.on("error", (error) => {
-      reject(error);
-    });
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        reject(new Error(formatPythonError(stderr || stdout || `Python exited with code ${code}`)));
-      }
-    });
+function toColumnNames(headerRow: unknown[]): string[] {
+  return headerRow.map((value, index) => {
+    const name = String(value ?? "").trim();
+    if (name.length > 0) {
+      return name;
+    }
+    return `column_${index + 1}`;
   });
+}
+
+function extractFromSheet(
+  rows: unknown[][],
+  sourceFile: string,
+  sheet: string,
+  domain: string,
+  exact: boolean,
+  selectedColumns: Set<string> | null
+): { matches: ResultRow[]; matchedColumns: number } {
+  if (rows.length === 0) {
+    return { matches: [], matchedColumns: 0 };
+  }
+
+  const headers = toColumnNames(rows[0]);
+  let indexesToScan = headers.map((_, index) => index);
+  let matchedColumns = 0;
+
+  if (selectedColumns) {
+    indexesToScan = headers
+      .map((name, index) => ({ name, index }))
+      .filter(({ name }) => selectedColumns.has(name.trim().toLowerCase()))
+      .map(({ index }) => index);
+    matchedColumns = indexesToScan.length;
+  }
+
+  const matches: ResultRow[] = [];
+  for (let rowIndex = 1; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex] ?? [];
+    for (const columnIndex of indexesToScan) {
+      const value = row[columnIndex];
+      if (value === null || value === undefined) {
+        continue;
+      }
+      const emails = String(value).match(EMAIL_RE) ?? [];
+      for (const rawEmail of emails) {
+        const email = rawEmail.toLowerCase();
+        if (!domainMatches(email, domain, exact)) {
+          continue;
+        }
+        matches.push({
+          email,
+          domain,
+          source_file: sourceFile,
+          sheet,
+          row_index: rowIndex,
+          column: headers[columnIndex]
+        });
+      }
+    }
+  }
+
+  return { matches, matchedColumns };
+}
+
+async function processFile(
+  file: File,
+  domain: string,
+  exact: boolean,
+  selectedColumns: Set<string> | null
+): Promise<{ rows: ResultRow[]; matchedColumns: number }> {
+  const extension = path.extname(file.name).toLowerCase();
+  if (!SUPPORTED_EXTENSIONS.has(extension)) {
+    throw new Error(`Unsupported file type: ${file.name}`);
+  }
+
+  const fileBuffer = Buffer.from(await file.arrayBuffer());
+  const workbook =
+    extension === ".tsv"
+      ? XLSX.read(fileBuffer, { type: "buffer", FS: "\t" })
+      : XLSX.read(fileBuffer, { type: "buffer" });
+
+  const isDelimited = extension === ".csv" || extension === ".tsv";
+  let matchedColumns = 0;
+  const allRows: ResultRow[] = [];
+
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    if (!sheet) {
+      continue;
+    }
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+      header: 1,
+      raw: false,
+      defval: null
+    }) as unknown[][];
+    if (rows.length === 0) {
+      continue;
+    }
+
+    const extracted = extractFromSheet(
+      rows,
+      file.name,
+      isDelimited ? "(csv)" : sheetName,
+      domain,
+      exact,
+      selectedColumns
+    );
+
+    allRows.push(...extracted.matches);
+    matchedColumns += extracted.matchedColumns;
+  }
+
+  return { rows: allRows, matchedColumns };
+}
+
+function dedupeRows(rows: ResultRow[]): ResultRow[] {
+  const seen = new Set<string>();
+  const deduped: ResultRow[] = [];
+  for (const row of rows) {
+    if (seen.has(row.email)) {
+      continue;
+    }
+    seen.add(row.email);
+    deduped.push(row);
+  }
+  return deduped;
+}
+
+function buildWorkbookBuffer(rows: ResultRow[]): Buffer {
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "emails");
+  return XLSX.write(workbook, { bookType: "xlsx", type: "buffer" }) as Buffer;
 }
 
 export async function POST(req: Request) {
   const formData = await req.formData();
-  const domain = formData.get("domain");
-  const columns = formData.get("columns");
+  const domainValue = formData.get("domain");
+  const columnsValue = formData.get("columns");
   const exact = formData.get("exact") === "true";
   const dedupe = formData.get("dedupe") === "true";
 
-  if (typeof domain !== "string" || !domain.trim()) {
+  if (typeof domainValue !== "string" || !domainValue.trim()) {
     return NextResponse.json({ error: "Domain is required." }, { status: 400 });
   }
 
@@ -97,43 +199,43 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "No files uploaded." }, { status: 400 });
   }
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "email-domain-filter-"));
-  const repoRoot = process.cwd();
-  const outputPath = path.join(tmpDir, "emails.xlsx");
+  const domain = normalizeDomain(domainValue);
+  if (!domain) {
+    return NextResponse.json({ error: "Domain is required." }, { status: 400 });
+  }
+
+  const selectedColumns =
+    typeof columnsValue === "string" && columnsValue.trim()
+      ? parseColumns(columnsValue)
+      : null;
 
   try {
-    const inputPaths: string[] = [];
+    let matchedColumnsTotal = 0;
+    const allMatches: ResultRow[] = [];
+
     for (const file of files) {
-      inputPaths.push(await saveFile(file, tmpDir));
+      const processed = await processFile(file, domain, exact, selectedColumns);
+      allMatches.push(...processed.rows);
+      matchedColumnsTotal += processed.matchedColumns;
     }
 
-    const args = [
-      path.join("scripts", "filter_emails.py"),
-      "--domain",
-      domain,
-      "--input",
-      ...inputPaths,
-      "--output",
-      outputPath
-    ];
-
-    if (typeof columns === "string" && columns.trim().length > 0) {
-      args.push("--columns", columns.trim());
-    }
-    if (exact) {
-      args.push("--exact");
-    }
-    if (dedupe) {
-      args.push("--dedupe");
+    if (selectedColumns && matchedColumnsTotal === 0) {
+      return NextResponse.json(
+        { error: "None of the specified columns were found in the inputs." },
+        { status: 400 }
+      );
     }
 
-    const pythonBin = await findPythonExecutable(repoRoot);
-    await runPython(pythonBin, args, repoRoot);
+    if (allMatches.length === 0) {
+      return NextResponse.json({ error: "No matching emails found." }, { status: 400 });
+    }
 
-    const buffer = await fs.readFile(outputPath);
-    const filename = `emails_${domain.replace("@", "").trim() || "output"}.xlsx`;
+    const finalRows = dedupe ? dedupeRows(allMatches) : allMatches;
+    const outputBuffer = buildWorkbookBuffer(finalRows);
+    const responseBody = new Uint8Array(outputBuffer);
+    const filename = `emails_${domain || "output"}.xlsx`;
 
-    return new NextResponse(buffer, {
+    return new NextResponse(responseBody, {
       status: 200,
       headers: {
         "Content-Type":
@@ -144,7 +246,5 @@ export async function POST(req: Request) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
-  } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
   }
 }
